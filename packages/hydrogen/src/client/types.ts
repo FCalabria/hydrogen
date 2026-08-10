@@ -5,12 +5,15 @@ import type {
 } from "gql.tada";
 
 import type { CacheInstance, WaitUntil } from "../core/cache/run-with-cache";
-import type { ShopifyRequestContext } from "../core/headers";
+import type {
+  ShopifyRequestContext,
+  ShopifyRequestContextWithBuyerIp,
+} from "../core/request-context";
 import type { AnyStorefrontQueryString, SourceOf, StorefrontQueryString } from "../graphql";
 import type { InferResult, InferVariables } from "../graphql";
 import type { InferOperationKind } from "../graphql/type-resolver";
 
-export type { I18nConfig } from "../core/headers";
+export type { I18nConfig } from "../core/request-context";
 
 type DocLike = TadaDocumentNode<any, any> | AnyStorefrontQueryString;
 type InferredDoc<T extends string> = StorefrontQueryString<InferResult<T>, InferVariables<T>, T>;
@@ -53,8 +56,17 @@ export interface GraphQLFormattedError {
 
 type CommonOptions = {
   storeDomain: string;
+  /**
+   * Storefront API version used in the GraphQL endpoint path (`/api/<version>/graphql.json`).
+   * Defaults to the version baked into the package. To send some queries to a different endpoint
+   * version (e.g. `unstable`), create a second `createStorefrontClient` instance with that
+   * `apiVersion` so version routing stays explicit. Hydrogen's bundled gql.tada schema still
+   * controls type inference, so queries against fields outside that schema need their own typing.
+   */
   apiVersion?: string;
   defaultTimeoutInMs?: number;
+  // Mirrored by the `cache?: CacheConfig` inference hole in
+  // CreateStorefrontClientArgs — keep the key and type in sync.
   cache?: CacheInstance;
   waitUntil?: WaitUntil;
 };
@@ -79,7 +91,7 @@ export interface PublicClientOptions<
 /**
  * Private client — uses a private Storefront Access Token.
  *
- * `buyerIp` must be resolved before creating the client.
+ * `buyerIp` must be resolved on the request context before creating the client.
  *
  * Best for: SSR/server-side requests where you control the fetch
  * layer and can forward trusted buyer context.
@@ -91,7 +103,6 @@ export interface PrivateClientOptions<
 > extends CommonOptions {
   fetch?: Fetch;
   privateStorefrontToken: string;
-  buyerIp: string;
 }
 
 /**
@@ -113,23 +124,31 @@ export type StorefrontClientOptions =
   | PrivateClientOptions
   | PrivateNoBuyerContextClientOptions;
 
+// `Type` and `CacheConfig` are inference holes for `createStorefrontClient`:
+// each member's discriminant is intersected with `Type` (resolving to the plain
+// literal when `Type` is the full `ClientType` default) and `cache` narrows
+// `CacheConfig`, so the call signature can recover both without wrapping this
+// union in an intersection — which would defeat discriminant narrowing and
+// excess-property checks while the user is still typing.
 export type CreateStorefrontClientArgs<
   RequestContext extends ShopifyRequestContext = ShopifyRequestContext,
+  Type extends ClientType = ClientType,
+  CacheConfig extends CacheInstance | undefined = CacheInstance | undefined,
 > =
   | {
-      type: "public";
+      type: "public" & Type;
       requestContext: RequestContext;
-      config: PublicClientOptions<AnyFetch | undefined>;
+      config: PublicClientOptions<AnyFetch | undefined> & { cache?: CacheConfig };
     }
   | {
-      type: "private";
-      requestContext: RequestContext;
-      config: PrivateClientOptions<AnyFetch | undefined>;
+      type: "private" & Type;
+      requestContext: RequestContext & ShopifyRequestContextWithBuyerIp;
+      config: PrivateClientOptions<AnyFetch | undefined> & { cache?: CacheConfig };
     }
   | {
-      type: "private_no_buyer_context";
+      type: "private_no_buyer_context" & Type;
       requestContext: RequestContext;
-      config: PrivateNoBuyerContextClientOptions<AnyFetch | undefined>;
+      config: PrivateNoBuyerContextClientOptions<AnyFetch | undefined> & { cache?: CacheConfig };
     };
 type AutoAddedVariableNames = "country" | "language";
 type UserVariables<Doc> = Omit<VariablesOfDoc<Doc>, AutoAddedVariableNames>;
@@ -201,11 +220,11 @@ export type PublicStorefrontClient<
 
 export type PrivateStorefrontClient<
   Extra extends Record<string, unknown> = {},
-  RequestContext extends ShopifyRequestContext = ShopifyRequestContext,
+  RequestContext extends ShopifyRequestContextWithBuyerIp = ShopifyRequestContextWithBuyerIp,
 > = StorefrontClient<Extra, "private", RequestContext>;
 
 export type RequestScopedPrivateStorefrontClient<Extra extends Record<string, unknown> = {}> =
-  PrivateStorefrontClient<Extra, ShopifyRequestContext>;
+  PrivateStorefrontClient<Extra, ShopifyRequestContextWithBuyerIp>;
 
 export type PrivateNoBuyerContextStorefrontClient<
   Extra extends Record<string, unknown> = {},

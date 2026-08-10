@@ -1,9 +1,10 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 import { createStorefrontClient } from "../../client/client";
-import { handleShopifyRoutes as handleShopifyRoutesImpl } from "../handle-shopify-routes";
-import { createShopifyRequestContext } from "../headers";
-import { assert } from "../test-utils";
+import { configureLogging, resetLoggingForTests } from "../logging";
+import { createShopifyRequestContext } from "../request-context";
+import { handleShopifyRoutes as handleShopifyRoutesImpl } from "../request-routing/handle-shopify-routes";
+import { assert, createTestLogger } from "../test-utils";
 import { createCartServerHandlers } from "./server-handlers";
 
 type TestStorefrontConfig = {
@@ -119,11 +120,11 @@ function createPrivateStorefrontClient(
     requestContext: createShopifyRequestContext({
       request,
       i18n: fixture.i18n ?? DEFAULT_I18N,
+      buyerIp: "127.0.0.1",
     }),
     config: {
       storeDomain: fixture.storeDomain,
       privateStorefrontToken: "test-private-token",
-      buyerIp: "127.0.0.1",
     },
   });
 }
@@ -161,6 +162,10 @@ describe("createCartServerHandlers", () => {
   beforeEach(() => {
     mockFetch = vi.fn();
     vi.stubGlobal("fetch", mockFetch);
+  });
+
+  afterEach(() => {
+    resetLoggingForTests();
   });
 
   describe("handler contract", () => {
@@ -273,6 +278,32 @@ describe("createCartServerHandlers", () => {
       expect(body.cart).toEqual(MOCK_CART);
     });
 
+    it("prevents shared caches from storing cart responses", async () => {
+      mockFetch.mockResolvedValueOnce(
+        mockGqlResponse(
+          { cart: MOCK_CART },
+          {
+            "cache-control": "public, max-age=600",
+            "cdn-cache-control": "public, s-maxage=600",
+            "cloudflare-cdn-cache-control": "public, s-maxage=600",
+            "netlify-cdn-cache-control": "public, s-maxage=600",
+            "surrogate-control": "max-age=600",
+          },
+        ),
+      );
+
+      const result = await handleCartRequest(createGetRequest("cart=123"), defaultConfig);
+
+      assert(result, "expected a response");
+      expect(result.headers.get("cache-control")).toBe(
+        "private, no-store, max-age=0, must-revalidate",
+      );
+      expect(result.headers.get("cdn-cache-control")).toBeNull();
+      expect(result.headers.get("cloudflare-cdn-cache-control")).toBeNull();
+      expect(result.headers.get("netlify-cdn-cache-control")).toBeNull();
+      expect(result.headers.get("surrogate-control")).toBeNull();
+    });
+
     it("forwards SFAPI server-timing when cart cookie is present", async () => {
       mockFetch.mockResolvedValueOnce(
         mockGqlResponse(
@@ -338,20 +369,17 @@ describe("createCartServerHandlers", () => {
     });
 
     it("returns null cart with GraphQL errors", async () => {
+      const logger = createTestLogger();
+      configureLogging({ logger });
       mockFetch.mockResolvedValueOnce(mockGqlErrorResponse([{ message: "Cart not found" }]));
-      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
 
-      try {
-        const result = await handleCartRequest(createGetRequest("cart=123"), defaultConfig);
-        assert(result, "expected a response");
-        const body = await result.json();
-        expect(body.cart).toBeNull();
-        expect(body.errors).toEqual([{ message: "Cart not found" }]);
-        expect(consoleError).toHaveBeenCalledOnce();
-        expect(consoleError).toHaveBeenCalledWith("Cart not found");
-      } finally {
-        consoleError.mockRestore();
-      }
+      const result = await handleCartRequest(createGetRequest("cart=123"), defaultConfig);
+      assert(result, "expected a response");
+      const body = await result.json();
+      expect(body.cart).toBeNull();
+      expect(body.errors).toEqual([{ message: "Cart not found" }]);
+      expect(logger.error).toHaveBeenCalledOnce();
+      expect(logger.error).toHaveBeenCalledWith("Cart not found", { scope: "cart-api" });
     });
   });
 

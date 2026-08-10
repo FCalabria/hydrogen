@@ -107,13 +107,21 @@ function createMockStore(initialData?: MockInitialData): MockCartStore {
         : initialData
       : null;
   let state: CartState = cart
-    ? makeCartState({ ...cart, loading: false, errors: createEmptyCartErrors() })
+    ? makeCartState({
+        ...cart,
+        loading: false,
+        errors: createEmptyCartErrors(),
+      })
     : { ...EMPTY_CART_STATE };
   const store = {
     connect: vi.fn(),
     destroy: vi.fn(),
     hydrate: vi.fn((data: CartData) => {
-      state = makeCartState({ ...data, loading: false, errors: createEmptyCartErrors() });
+      state = makeCartState({
+        ...data,
+        loading: false,
+        errors: createEmptyCartErrors(),
+      });
     }),
     getState: vi.fn(() => state),
     subscribe: vi.fn((fn: () => void) => {
@@ -151,7 +159,9 @@ describe("CartProvider", () => {
 
     render(createElement(CartProvider, { initialData: { cart: data } }, null));
 
-    expect(createCartStore).toHaveBeenCalledWith({ initialData: { cart: data } });
+    expect(createCartStore).toHaveBeenCalledWith({
+      initialData: { cart: data },
+    });
   });
 
   it("does not recreate store on re-render", () => {
@@ -166,13 +176,17 @@ describe("CartProvider", () => {
   it("does not fetch when initialData has an empty cart fixture", () => {
     render(createElement(CartProvider, { initialData: { cart: EMPTY_CART_DATA } }, null));
 
-    expect(createCartStore).toHaveBeenCalledWith({ initialData: { cart: EMPTY_CART_DATA } });
+    expect(createCartStore).toHaveBeenCalledWith({
+      initialData: { cart: EMPTY_CART_DATA },
+    });
     expect(latestStore.connect).toHaveBeenCalledTimes(1);
     expect(latestStore.fetch).not.toHaveBeenCalled();
   });
 
   it("does not fetch when async initialData is provided", () => {
-    const initialData = Promise.resolve({ cart: makeCartData({ totalQuantity: 5 }) });
+    const initialData = Promise.resolve({
+      cart: makeCartData({ totalQuantity: 5 }),
+    });
 
     render(createElement(CartProvider, { initialData }, null));
 
@@ -184,7 +198,9 @@ describe("CartProvider", () => {
   it("does not fetch when initialData has a null cart", () => {
     render(createElement(CartProvider, { initialData: { cart: null } }, null));
 
-    expect(createCartStore).toHaveBeenCalledWith({ initialData: { cart: null } });
+    expect(createCartStore).toHaveBeenCalledWith({
+      initialData: { cart: null },
+    });
     expect(latestStore.connect).toHaveBeenCalledTimes(1);
     expect(latestStore.fetch).not.toHaveBeenCalled();
   });
@@ -235,7 +251,10 @@ describe("useCart", () => {
           totalQuantity: 3,
           errors: {
             ...createEmptyCartErrors(),
-            cart: { userErrors: [{ code: "INVALID" as const, message: "Y" }], warnings: [] },
+            cart: {
+              userErrors: [{ code: "INVALID" as const, message: "Y" }],
+              warnings: [],
+            },
           },
         }),
       );
@@ -403,7 +422,9 @@ describe("useSuspenseCart", () => {
           null,
           createElement(
             Suspense,
-            { fallback: createElement("span", { "data-testid": "fallback" }, "Loading") },
+            {
+              fallback: createElement("span", { "data-testid": "fallback" }, "Loading"),
+            },
             createElement(Consumer),
           ),
         ),
@@ -647,6 +668,7 @@ describe("useCart pending state", () => {
           note: false,
           attributes: false,
           discountCodes: new Set(),
+          cost: true,
         },
       }),
     );
@@ -669,7 +691,13 @@ describe("useCart pending state", () => {
     const mockStore = createMockStore();
     mockStore.setState(
       makeCartState({
-        pending: { lines: new Set(), note: true, attributes: false, discountCodes: new Set() },
+        pending: {
+          lines: new Set(),
+          note: true,
+          attributes: false,
+          discountCodes: new Set(),
+          cost: false,
+        },
       }),
     );
     vi.mocked(createCartStore).mockImplementation(() => mockStore);
@@ -692,6 +720,7 @@ describe("useCart pending state", () => {
           note: false,
           attributes: false,
           discountCodes: new Set(["SAVE10"]),
+          cost: true,
         },
       }),
     );
@@ -704,6 +733,30 @@ describe("useCart pending state", () => {
         { "data-testid": "result" },
         pendingCodes.has("SAVE10") ? "yes" : "no",
       );
+    }
+
+    render(createElement(CartProvider, null, createElement(Consumer)));
+    expect(screen.getByTestId("result").textContent).toBe("yes");
+  });
+
+  it("useCart(s => s.pending.cost) returns pending cost boolean", () => {
+    const mockStore = createMockStore();
+    mockStore.setState(
+      makeCartState({
+        pending: {
+          lines: new Set(),
+          note: false,
+          attributes: false,
+          discountCodes: new Set(),
+          cost: true,
+        },
+      }),
+    );
+    vi.mocked(createCartStore).mockImplementation(() => mockStore);
+
+    function Consumer() {
+      const pendingCost = useCart((s) => s.pending.cost);
+      return createElement("span", { "data-testid": "result" }, pendingCost ? "yes" : "no");
     }
 
     render(createElement(CartProvider, null, createElement(Consumer)));

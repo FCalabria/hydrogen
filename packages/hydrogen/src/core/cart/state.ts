@@ -42,8 +42,10 @@ export interface CartLineMerchandise {
 export interface CartLine {
   id: string;
   quantity: number;
+  attributes?: Attribute[];
   cost: CartLineCost;
   merchandise?: CartLineMerchandise;
+  sellingPlanAllocation?: { sellingPlan: { id: string } } | null;
   parentRelationship?: { parent: { id: string } } | null;
   lineComponents?: CartLine[];
 }
@@ -89,6 +91,7 @@ export interface CartPending {
   note: boolean;
   attributes: boolean;
   discountCodes: Set<string>;
+  cost?: boolean;
 }
 
 export interface CartErrorState {
@@ -125,11 +128,18 @@ export interface CartState<TData extends CartData = CartData> {
   /** Non-rejecting signal that resolves when the current full-cart load settles or is invalidated. */
   readonly readyPromise?: PromiseLike<void>;
   pending: CartPending;
+  revalidating?: boolean;
   errors: CartErrorState;
 }
 
 export function createEmptyPending(): CartPending {
-  return { lines: new Set(), note: false, attributes: false, discountCodes: new Set() };
+  return {
+    lines: new Set(),
+    note: false,
+    attributes: false,
+    discountCodes: new Set(),
+    cost: false,
+  };
 }
 
 export function createEmptyErrorGroup(): CartErrorGroup {

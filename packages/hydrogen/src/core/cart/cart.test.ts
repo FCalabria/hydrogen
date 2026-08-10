@@ -2,11 +2,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 import type { CartActionError } from "../../../vendor/standard-actions";
+import { configureLogging, resetLoggingForTests } from "../logging";
 import {
   SHOPIFY_STOREFRONT_STANDARD_ACTIONS_SCRIPT,
   VISITOR_CONSENT_COLLECTED_EVENT,
 } from "../shopify-scripts";
-import { assert } from "../test-utils";
+import { assert, createTestLogger } from "../test-utils";
 import {
   configureCartEndpoint,
   getShopifyStandardActions,
@@ -59,7 +60,11 @@ const serverResult = (overrides: Record<string, unknown> = {}) => ({
     totalQuantity: 1,
     cost: { totalAmount: { amount: "10", currencyCode: "USD" } },
     lines: [
-      { id: "line-1", quantity: 1, cost: { totalAmount: { amount: "10", currencyCode: "USD" } } },
+      {
+        id: "line-1",
+        quantity: 1,
+        cost: { totalAmount: { amount: "10", currencyCode: "USD" } },
+      },
     ],
     discountCodes: [],
     ...overrides,
@@ -81,10 +86,14 @@ const serverCart = (totalQuantity: number, lines: Array<{ id: string; quantity: 
   cart: {
     id: "gid://shopify/Cart/123",
     totalQuantity,
-    cost: { totalAmount: { amount: String(totalQuantity * 10), currencyCode: "USD" } },
+    cost: {
+      totalAmount: { amount: String(totalQuantity * 10), currencyCode: "USD" },
+    },
     lines: lines.map((l) => ({
       ...l,
-      cost: { totalAmount: { amount: String(l.quantity * 10), currencyCode: "USD" } },
+      cost: {
+        totalAmount: { amount: String(l.quantity * 10), currencyCode: "USD" },
+      },
     })),
     discountCodes: [],
   },
@@ -148,6 +157,11 @@ interface Deferred<T = unknown> {
   reject: (reason?: unknown) => void;
 }
 
+interface UpdateDeferred extends Deferred {
+  resolveEvent: (value: unknown) => void;
+  resolveReturn: (value: unknown) => void;
+}
+
 function createDeferred<T = unknown>(): Deferred<T> {
   let resolve!: (value: T) => void;
   let reject!: (reason?: unknown) => void;
@@ -160,7 +174,7 @@ function createDeferred<T = unknown>(): Deferred<T> {
 
 const nextTick = () => Promise.resolve();
 
-let updateDeferreds: Deferred[] = [];
+let updateDeferreds: UpdateDeferred[] = [];
 let configuredUpdateCartHandler:
   | ((
       defaultHandler: () => Promise<unknown>,
@@ -170,7 +184,7 @@ let configuredUpdateCartHandler:
   | null = null;
 let configuredUpdateCartEventTarget: (() => EventTarget) | null = null;
 
-function createStandardActionsMock() {
+function createStandardActionsMock({ dispatchEvents = true } = {}) {
   let isDefault = true;
   const mock = Object.assign(vi.fn(), {
     configure: vi.fn(),
@@ -198,7 +212,7 @@ function createStandardActionsMock() {
     // the event deferred — only the return deferred matters for callers.
     eventDeferred.promise.catch(() => {});
 
-    if (payload.lines) {
+    if (dispatchEvents && payload.lines) {
       const action = payload.lines.some((l: any) => l.merchandiseId)
         ? "add"
         : payload.lines.some((l: any) => l.quantity === 0)
@@ -206,7 +220,10 @@ function createStandardActionsMock() {
           : "update";
 
       const event = Object.assign(
-        new Event("shopify:cart:lines-update", { bubbles: true, cancelable: true }),
+        new Event("shopify:cart:lines-update", {
+          bubbles: true,
+          cancelable: true,
+        }),
         {
           action,
           context: "standard-action" as const,
@@ -216,28 +233,40 @@ function createStandardActionsMock() {
         },
       );
       document.dispatchEvent(event);
-    } else if (payload.discountCodes !== undefined) {
+    } else if (dispatchEvents && payload.discountCodes !== undefined) {
       const event = Object.assign(
-        new Event("shopify:cart:discount-update", { bubbles: true, cancelable: true }),
+        new Event("shopify:cart:discount-update", {
+          bubbles: true,
+          cancelable: true,
+        }),
         {
-          discountCodes: payload.discountCodes.map((c: string) => ({ code: c })),
+          discountCodes: payload.discountCodes.map((c: string) => ({
+            code: c,
+          })),
           promise: eventDeferred.promise,
           detail: (options as any)?.event?.detail,
         },
       );
       document.dispatchEvent(event);
-    } else if (payload.note !== undefined) {
+    } else if (dispatchEvents && payload.note !== undefined) {
       const event = Object.assign(
-        new Event("shopify:cart:note-update", { bubbles: true, cancelable: true }),
+        new Event("shopify:cart:note-update", {
+          bubbles: true,
+          cancelable: true,
+        }),
         {
           note: payload.note,
           promise: eventDeferred.promise,
+          detail: (options as any)?.event?.detail,
         },
       );
       document.dispatchEvent(event);
     } else if (payload.attributes !== undefined) {
       const event = Object.assign(
-        new Event("shopify:cart:attributes-update", { bubbles: true, cancelable: true }),
+        new Event("shopify:cart:attributes-update", {
+          bubbles: true,
+          cancelable: true,
+        }),
         {
           attributes: payload.attributes,
           promise: eventDeferred.promise,
@@ -256,6 +285,8 @@ function createStandardActionsMock() {
 
     updateDeferreds.push({
       promise: returnDeferred.promise,
+      resolveEvent: eventDeferred.resolve,
+      resolveReturn: returnDeferred.resolve,
       resolve: (v: unknown) => {
         eventDeferred.resolve(v);
         returnDeferred.resolve(v);
@@ -278,6 +309,14 @@ function resolveUpdate(index: number, value: unknown): void {
 
 function rejectUpdate(index: number, error: unknown): void {
   updateDeferreds[index].reject(error);
+}
+
+function resolveUpdateEvent(index: number, value: unknown): void {
+  updateDeferreds[index].resolveEvent(value);
+}
+
+function resolveUpdateReturn(index: number, value: unknown): void {
+  updateDeferreds[index].resolveReturn(value);
 }
 
 function cartActionError(cause: CartActionError["cause"], message = "Cart action failed"): Error {
@@ -306,6 +345,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  resetLoggingForTests();
   store.destroy();
   resetStandardActionsForTests();
   document
@@ -319,10 +359,16 @@ describe("createCartStore", () => {
       initialData: {
         cart: makeCartState({
           loading: true,
-          pending: makePending({ lines: new Set(["line-1"]), discountCodes: new Set(["SAVE10"]) }),
+          pending: makePending({
+            lines: new Set(["line-1"]),
+            discountCodes: new Set(["SAVE10"]),
+          }),
           errors: {
             ...createEmptyCartErrors(),
-            cart: { userErrors: [{ code: "INVALID", message: "old" }], warnings: [] },
+            cart: {
+              userErrors: [{ code: "INVALID", message: "old" }],
+              warnings: [],
+            },
           },
         }),
       },
@@ -335,6 +381,7 @@ describe("createCartStore", () => {
       note: false,
       attributes: false,
       discountCodes: new Set(),
+      cost: false,
     });
     expect(state.errors).toEqual(createEmptyCartErrors());
   });
@@ -446,32 +493,38 @@ describe("createCartStore", () => {
   });
 
   it("sets loading to false when connected async initialData rejects", async () => {
+    const logger = createTestLogger();
+    configureLogging({ logger });
+
     const deferred = createDeferred<{ cart: CartData | null }>();
     const localStore = createCartStore({ initialData: deferred.promise });
     const error = new Error("initial data failed");
-    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     localStore.connect();
     deferred.reject(error);
 
     await vi.waitFor(() => {
       expect(localStore.getState().loading).toBe(false);
-      expect(consoleSpy).toHaveBeenCalledWith("[hydrogen] cart initial load failed:", error);
+      expect(logger.error).toHaveBeenCalledWith("cart initial load failed", {
+        scope: "cart",
+        error,
+      });
     });
 
-    consoleSpy.mockRestore();
     localStore.destroy();
   });
 
   it("allows fetch after connected async initialData rejects", async () => {
+    const logger = createTestLogger();
+    configureLogging({ logger });
+
     const deferred = createDeferred<{ cart: CartData | null }>();
     const localStore = createCartStore({ initialData: deferred.promise });
-    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     localStore.connect();
     deferred.reject(new Error("initial data failed"));
     await vi.waitFor(() => {
-      expect(consoleSpy).toHaveBeenCalled();
+      expect(logger.error).toHaveBeenCalled();
     });
 
     mockGetCart.mockResolvedValue({
@@ -483,7 +536,6 @@ describe("createCartStore", () => {
     expect(mockGetCart).toHaveBeenCalledTimes(1);
     expect(localStore.getState().data.totalQuantity).toBe(6);
 
-    consoleSpy.mockRestore();
     localStore.destroy();
   });
 
@@ -507,7 +559,9 @@ describe("createCartStore", () => {
 
   it("settles readiness when an optimistic mutation invalidates initialData", async () => {
     const initialDeferred = createDeferred<{ cart: CartData | null }>();
-    const localStore = createCartStore({ initialData: initialDeferred.promise });
+    const localStore = createCartStore({
+      initialData: initialDeferred.promise,
+    });
     const readyPromise = localStore.getState().readyPromise;
 
     assert(readyPromise, "Expected async initialData to create a readyPromise");
@@ -623,10 +677,16 @@ describe("CartStore.hydrate", () => {
   it("resets pending state on hydration", () => {
     store.hydrate(
       makeCartState({
-        pending: makePending({ lines: new Set(["line-1"]), discountCodes: new Set(["SAVE10"]) }),
+        pending: makePending({
+          lines: new Set(["line-1"]),
+          discountCodes: new Set(["SAVE10"]),
+        }),
         errors: {
           ...createEmptyCartErrors(),
-          cart: { userErrors: [{ code: "INVALID", message: "old" }], warnings: [] },
+          cart: {
+            userErrors: [{ code: "INVALID", message: "old" }],
+            warnings: [],
+          },
         },
       }),
     );
@@ -696,7 +756,9 @@ describe("CartStore.subscribe", () => {
     store.hydrate(makeCartState({ totalQuantity: 5 }));
     expect(listener).toHaveBeenCalledTimes(1);
     expect(listener).toHaveBeenCalledWith(
-      expect.objectContaining({ data: expect.objectContaining({ totalQuantity: 5 }) }),
+      expect.objectContaining({
+        data: expect.objectContaining({ totalQuantity: 5 }),
+      }),
     );
 
     unsub();
@@ -721,7 +783,9 @@ describe("CartStore.reset", () => {
   });
 
   it("hydrates with a fresh full-cart load after clearing connected state", async () => {
-    mockGetCart.mockResolvedValueOnce({ cart: makeCartState({ totalQuantity: 7 }) });
+    mockGetCart.mockResolvedValueOnce({
+      cart: makeCartState({ totalQuantity: 7 }),
+    });
     store.hydrate(makeCartState({ totalQuantity: 5 }));
 
     store.reset();
@@ -737,7 +801,9 @@ describe("CartStore.reset", () => {
   it("ignores async initialData that resolves after reset", async () => {
     const initialDeferred = createDeferred<{ cart: CartData | null }>();
     const resetDeferred = createDeferred<{ cart: CartData | null }>();
-    const localStore = createCartStore({ initialData: initialDeferred.promise });
+    const localStore = createCartStore({
+      initialData: initialDeferred.promise,
+    });
     mockGetCart.mockReturnValue(resetDeferred.promise);
 
     localStore.connect();
@@ -1074,7 +1140,9 @@ describe("CartStore.handleFormSubmit — line mutations", () => {
           {
             id: "line-1",
             quantity: quantityAvailable,
-            cost: { totalAmount: { amount: clampedTotalAmount, currencyCode: "USD" } },
+            cost: {
+              totalAmount: { amount: clampedTotalAmount, currencyCode: "USD" },
+            },
           },
         ],
       },
@@ -1125,7 +1193,12 @@ describe("CartStore.handleFormSubmit — line mutations", () => {
           {
             id: "line-1",
             quantity: requestedQuantity,
-            cost: { totalAmount: { amount: requestedTotalAmount, currencyCode: "USD" } },
+            cost: {
+              totalAmount: {
+                amount: requestedTotalAmount,
+                currencyCode: "USD",
+              },
+            },
           },
         ],
       },
@@ -1263,6 +1336,89 @@ describe("CartStore.handleFormSubmit — discount mutations", () => {
     await promise;
 
     expect(store.getState().pending.discountCodes.size).toBe(0);
+  });
+
+  it("discount-apply tracks pending.cost", async () => {
+    const event = submitForm({ discountCode: "NEW10" }, "intent", "discount-apply");
+    const promise = store.handleFormSubmit(event);
+    await nextTick();
+
+    expect(store.getState().pending.cost).toBe(true);
+
+    resolveUpdate(0, {
+      cart: {
+        id: "gid://shopify/Cart/123",
+        totalQuantity: 0,
+        cost: { totalAmount: { amount: "0", currencyCode: "USD" } },
+        lines: [],
+        discountCodes: [
+          { code: "EXISTING", applicable: true },
+          { code: "NEW10", applicable: true },
+        ],
+      },
+    });
+    await promise;
+
+    expect(store.getState().pending.cost).toBe(false);
+  });
+
+  it("discount-apply settles line prices from the server cart", async () => {
+    const originalAmount = "20";
+    const discountedAmount = "15";
+    const line = makeLine({
+      id: "line-1",
+      quantity: 1,
+      cost: {
+        totalAmount: { amount: originalAmount, currencyCode: "USD" },
+        subtotalAmount: { amount: originalAmount, currencyCode: "USD" },
+        amountPerQuantity: { amount: originalAmount, currencyCode: "USD" },
+        compareAtAmountPerQuantity: null,
+      },
+    });
+    store.hydrate(makeCartState({ lines: [line], totalQuantity: 1 }));
+
+    const event = submitForm({ discountCode: "NEW10" }, "intent", "discount-apply");
+    const promise = store.handleFormSubmit(event);
+    await nextTick();
+
+    resolveUpdate(0, {
+      cart: {
+        ...makeCartState({
+          lines: [
+            makeLine({
+              id: "line-1",
+              quantity: 1,
+              cost: {
+                totalAmount: { amount: discountedAmount, currencyCode: "USD" },
+                subtotalAmount: {
+                  amount: discountedAmount,
+                  currencyCode: "USD",
+                },
+                amountPerQuantity: {
+                  amount: discountedAmount,
+                  currencyCode: "USD",
+                },
+                compareAtAmountPerQuantity: null,
+              },
+            }),
+          ],
+          cost: {
+            ...EMPTY_CART_DATA.cost,
+            subtotalAmount: { amount: discountedAmount, currencyCode: "USD" },
+          },
+          discountCodes: [
+            { code: "EXISTING", applicable: true },
+            { code: "NEW10", applicable: true },
+          ],
+        }),
+      },
+    });
+    await promise;
+
+    const [settledLine] = getCartLines(store.getState().data);
+    assert(settledLine, "expected discount response to settle a cart line");
+    expect(settledLine.cost.totalAmount.amount).toBe(discountedAmount);
+    expect(store.getState().data.cost.subtotalAmount.amount).toBe(discountedAmount);
   });
 
   it("discount-apply preserves applicable status for existing codes during optimistic phase", async () => {
@@ -1468,6 +1624,460 @@ describe("CartStore.handleFormSubmit — concurrency", () => {
     await pB;
   });
 
+  it("concurrent removes: a stale out-of-order snapshot does not resurrect removed lines", async () => {
+    const lineA = makeLine({ id: "line-a", quantity: 1 });
+    const lineB = makeLine({ id: "line-b", quantity: 1 });
+    const lineC = makeLine({ id: "line-c", quantity: 1 });
+    const cartId = "gid://shopify/Cart/789";
+    const checkoutUrl = "https://checkout.example.test/cart";
+    const note = "Keep this note";
+    const pageInfo = { hasNextPage: false };
+    const authoritativeCost = {
+      ...EMPTY_CART_DATA.cost,
+      totalAmount: { amount: "5", currencyCode: "USD" },
+    };
+    mockGetCart.mockResolvedValue({
+      cart: {
+        id: cartId,
+        totalQuantity: 0,
+        cost: authoritativeCost,
+        lines: [],
+        discountCodes: [],
+      },
+    });
+    store.hydrate(
+      makeCartState({
+        id: cartId,
+        checkoutUrl,
+        note,
+        lines: { nodes: [lineA, lineB, lineC], pageInfo },
+        totalQuantity: 3,
+        customField: "preserved",
+      }),
+    );
+
+    const pA = store.handleFormSubmit(submitForm({ lineId: "line-a" }, "intent", "remove"));
+    const pB = store.handleFormSubmit(submitForm({ lineId: "line-b" }, "intent", "remove"));
+    const pC = store.handleFormSubmit(submitForm({ lineId: "line-c" }, "intent", "remove"));
+    await nextTick();
+
+    resolveUpdate(
+      2,
+      serverCart(2, [
+        { id: "line-a", quantity: 1 },
+        { id: "line-b", quantity: 1 },
+      ]),
+    );
+    resolveUpdate(1, serverCart(1, [{ id: "line-a", quantity: 1 }]));
+    resolveUpdate(
+      0,
+      serverCart(2, [
+        { id: "line-b", quantity: 1 },
+        { id: "line-c", quantity: 1 },
+      ]),
+    );
+
+    await Promise.all([pA, pB, pC]);
+    await vi.waitFor(() => expect(mockGetCart).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(store.getState().data.cost).toEqual(authoritativeCost));
+
+    expect(getCartLines(store.getState().data)).toEqual([]);
+    expect(store.getState().data.totalQuantity).toBe(0);
+    expect(store.getState().data.checkoutUrl).toBe(checkoutUrl);
+    expect(store.getState().data.note).toBe(note);
+    expect(store.getState().data.lines.pageInfo).toEqual(pageInfo);
+    expect(store.getState().data.customField).toBe("preserved");
+    expect(store.getState().pending.lines).toEqual(new Set());
+  });
+
+  it("coalesces mutations that start before an earlier transport settles", async () => {
+    const initialLineQuantity = 1;
+    const updatedLineQuantity = 2;
+    const initialTotalQuantity = 2;
+    const firstTotalQuantity = 3;
+    const authoritativeTotalQuantity = 4;
+    const lineA = makeLine({ id: "line-a", quantity: initialLineQuantity });
+    const lineB = makeLine({ id: "line-b", quantity: initialLineQuantity });
+    const authoritativeCart = makeCartState({
+      lines: [
+        { ...lineA, quantity: updatedLineQuantity },
+        { ...lineB, quantity: updatedLineQuantity },
+      ],
+      totalQuantity: authoritativeTotalQuantity,
+    });
+    mockGetCart.mockResolvedValue({ cart: authoritativeCart });
+    store.hydrate(
+      makeCartState({
+        lines: [lineA, lineB],
+        totalQuantity: initialTotalQuantity,
+      }),
+    );
+
+    const firstMutation = store.handleFormSubmit(
+      submitForm({ lineId: lineA.id }, "intent", "increase"),
+    );
+    await nextTick();
+
+    const firstResult = serverCart(firstTotalQuantity, [
+      { id: lineA.id, quantity: updatedLineQuantity },
+      { id: lineB.id, quantity: initialLineQuantity },
+    ]);
+    const secondResult = serverCart(authoritativeTotalQuantity, [
+      { id: lineA.id, quantity: updatedLineQuantity },
+      { id: lineB.id, quantity: updatedLineQuantity },
+    ]);
+    resolveUpdateEvent(0, firstResult);
+    await nextTick();
+    await nextTick();
+
+    const secondMutation = store.handleFormSubmit(
+      submitForm({ lineId: lineB.id }, "intent", "increase"),
+    );
+    await nextTick();
+    resolveUpdateEvent(1, secondResult);
+    resolveUpdateReturn(1, secondResult);
+    await nextTick();
+    await nextTick();
+
+    expect(mockGetCart).not.toHaveBeenCalled();
+
+    resolveUpdateReturn(0, firstResult);
+    await Promise.all([firstMutation, secondMutation]);
+    await vi.waitFor(() => expect(mockGetCart).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() =>
+      expect(store.getState().data.totalQuantity).toBe(authoritativeTotalQuantity),
+    );
+  });
+
+  it("a newer note snapshot does not double-count a pending quantity change", async () => {
+    const initialQuantity = 1;
+    const updatedQuantity = 2;
+    const line = makeLine({ id: "line-a", quantity: initialQuantity });
+    store.hydrate(
+      makeCartState({
+        id: "gid://shopify/Cart/quantity-note",
+        lines: [line],
+        totalQuantity: initialQuantity,
+      }),
+    );
+
+    const quantityPromise = store.handleFormSubmit(
+      submitForm({ lineId: line.id }, "intent", "increase"),
+    );
+    await nextTick();
+    const notePromise = mockUpdateCart({ note: "Gift wrapping please" });
+
+    const updatedCart = serverCart(updatedQuantity, [{ id: line.id, quantity: updatedQuantity }]);
+    resolveUpdate(1, updatedCart);
+    await notePromise;
+    resolveUpdate(0, updatedCart);
+    await quantityPromise;
+
+    expect(getCartLines(store.getState().data)[0].quantity).toBe(updatedQuantity);
+    expect(store.getState().data.totalQuantity).toBe(updatedQuantity);
+  });
+
+  it("stale overlapping discount snapshots do not remove a settled line", async () => {
+    const cartId = "gid://shopify/Cart/discount-overlap";
+    const variantId = "gid://shopify/ProductVariant/discounted";
+    const discountCode = "SAVE10";
+    const lineQuantity = 1;
+    const revalidation = createDeferred<{ cart: CartData }>();
+    mockGetCart.mockReturnValueOnce(revalidation.promise);
+    store.hydrate(makeCartState({ id: cartId, lines: [], totalQuantity: 0 }));
+
+    const addPromise = store.handleFormSubmit(
+      submitForm({ merchandiseId: variantId, quantity: String(lineQuantity) }, "intent", "add"),
+      { products: [productDetail(variantId)] },
+    );
+    await nextTick();
+
+    const discountPromise = store.handleFormSubmit(
+      submitForm({ discountCode }, "intent", "discount-apply"),
+    );
+    await nextTick();
+
+    const settledLine = lineWithMerchandise("line-a", lineQuantity, variantId);
+    resolveUpdate(0, {
+      cart: makeCartState({
+        id: cartId,
+        lines: [settledLine],
+        totalQuantity: lineQuantity,
+      }),
+    });
+    await addPromise;
+
+    resolveUpdate(1, {
+      cart: makeCartState({
+        id: cartId,
+        lines: [],
+        totalQuantity: 0,
+        discountCodes: [{ code: discountCode, applicable: true }],
+      }),
+    });
+    await discountPromise;
+
+    expect(getCartLines(store.getState().data).map((line) => line.id)).toEqual([settledLine.id]);
+    expect(store.getState().revalidating).toBe(true);
+
+    revalidation.resolve({
+      cart: makeCartState({
+        id: cartId,
+        lines: [settledLine],
+        totalQuantity: lineQuantity,
+      }),
+    });
+    await vi.waitFor(() => expect(store.getState().revalidating).toBeUndefined());
+  });
+
+  it("a mutation during revalidation discards stale data and triggers one trailing fetch", async () => {
+    const firstRevalidation = createDeferred<{ cart: CartData }>();
+    const secondRevalidation = createDeferred<{ cart: CartData }>();
+    mockGetCart
+      .mockReturnValueOnce(firstRevalidation.promise)
+      .mockReturnValueOnce(secondRevalidation.promise);
+
+    const lineA = makeLine({ id: "line-a", quantity: 1 });
+    const lineB = makeLine({ id: "line-b", quantity: 1 });
+    const cartId = "gid://shopify/Cart/revalidation";
+    store.hydrate(makeCartState({ id: cartId, lines: [lineA, lineB], totalQuantity: 2 }));
+
+    const removeA = store.handleFormSubmit(submitForm({ lineId: lineA.id }, "intent", "remove"));
+    const removeB = store.handleFormSubmit(submitForm({ lineId: lineB.id }, "intent", "remove"));
+    await nextTick();
+    resolveUpdate(1, serverCart(1, [{ id: lineA.id, quantity: 1 }]));
+    resolveUpdate(0, serverCart(1, [{ id: lineB.id, quantity: 1 }]));
+    await Promise.all([removeA, removeB]);
+    await vi.waitFor(() => expect(mockGetCart).toHaveBeenCalledTimes(1));
+    expect(store.getState().pending.lines).toEqual(new Set());
+    expect(store.getState().revalidating).toBe(true);
+
+    const notePromise = mockUpdateCart({ note: "Gift wrapping please" });
+    resolveUpdate(2, serverResult({ id: cartId, totalQuantity: 0, lines: [] }));
+    await notePromise;
+
+    firstRevalidation.resolve({
+      cart: makeCartState({ id: cartId, lines: [lineA], totalQuantity: 1 }),
+    });
+    await vi.waitFor(() => expect(mockGetCart).toHaveBeenCalledTimes(2));
+
+    const authoritativeCart = makeCartState({
+      id: cartId,
+      lines: [],
+      note: "Gift wrapping please",
+      totalQuantity: 0,
+    });
+    secondRevalidation.resolve({ cart: authoritativeCart });
+    await vi.waitFor(() => expect(store.getState().revalidating).toBeUndefined());
+
+    expect(getCartLines(store.getState().data)).toEqual([]);
+    expect(store.getState().data.totalQuantity).toBe(0);
+    expect(store.getState().data.note).toBe("Gift wrapping please");
+    expect(store.getState().pending.lines).toEqual(new Set());
+  });
+
+  it("sequential mutations do not trigger authoritative revalidation", async () => {
+    const cartId = "gid://shopify/Cart/sequential";
+    const lineId = "line-a";
+    const initialQuantity = 1;
+    const firstUpdatedQuantity = 2;
+    const secondUpdatedQuantity = 3;
+    store.hydrate(
+      makeCartState({
+        id: cartId,
+        lines: [makeLine({ id: lineId, quantity: initialQuantity })],
+        totalQuantity: initialQuantity,
+      }),
+    );
+
+    const firstMutation = store.handleFormSubmit(submitForm({ lineId }, "intent", "increase"));
+    await nextTick();
+    resolveUpdate(
+      0,
+      serverResult({
+        id: cartId,
+        totalQuantity: firstUpdatedQuantity,
+        lines: [{ id: lineId, quantity: firstUpdatedQuantity }],
+      }),
+    );
+    await firstMutation;
+
+    const secondMutation = store.handleFormSubmit(submitForm({ lineId }, "intent", "increase"));
+    await nextTick();
+    resolveUpdate(
+      1,
+      serverResult({
+        id: cartId,
+        totalQuantity: secondUpdatedQuantity,
+        lines: [{ id: lineId, quantity: secondUpdatedQuantity }],
+      }),
+    );
+    await secondMutation;
+    await nextTick();
+
+    expect(mockGetCart).not.toHaveBeenCalled();
+    expect(store.getState().data.totalQuantity).toBe(secondUpdatedQuantity);
+  });
+
+  it("reset ignores an in-flight authoritative revalidation", async () => {
+    const revalidation = createDeferred<{ cart: CartData }>();
+    mockGetCart.mockReturnValueOnce(revalidation.promise);
+    const cartId = "gid://shopify/Cart/reset-revalidation";
+    const lineQuantity = 1;
+    const removedQuantity = 0;
+    const initialTotalQuantity = lineQuantity * 2;
+    const lineA = makeLine({ id: "line-a", quantity: lineQuantity });
+    const lineB = makeLine({ id: "line-b", quantity: lineQuantity });
+    store.hydrate(
+      makeCartState({
+        id: cartId,
+        lines: [lineA, lineB],
+        totalQuantity: initialTotalQuantity,
+      }),
+    );
+
+    const removeA = mockUpdateCart({
+      lines: [{ id: lineA.id, quantity: removedQuantity }],
+    });
+    const removeB = mockUpdateCart({
+      lines: [{ id: lineB.id, quantity: removedQuantity }],
+    });
+    resolveUpdate(1, serverCart(lineQuantity, [{ id: lineA.id, quantity: lineQuantity }]));
+    resolveUpdate(0, serverCart(lineQuantity, [{ id: lineB.id, quantity: lineQuantity }]));
+    await Promise.all([removeA, removeB]);
+    await vi.waitFor(() => expect(mockGetCart).toHaveBeenCalledTimes(1));
+    const revalidationOptions = mockGetCart.mock.calls[0][1] as {
+      signal?: AbortSignal;
+    };
+    assert(revalidationOptions.signal, "expected revalidation signal");
+
+    store.reset();
+    expect(revalidationOptions.signal.aborted).toBe(true);
+    revalidation.resolve({
+      cart: makeCartState({
+        id: cartId,
+        lines: [lineA],
+        totalQuantity: lineQuantity,
+      }),
+    });
+    await nextTick();
+
+    expect(store.getState()).toEqual(EMPTY_CART_STATE);
+    expect(mockGetCart).toHaveBeenCalledTimes(1);
+  });
+
+  it("hydrating a different cart cancels in-flight authoritative revalidation", async () => {
+    const revalidation = createDeferred<{ cart: CartData }>();
+    mockGetCart.mockReturnValueOnce(revalidation.promise);
+    const initialCartId = "gid://shopify/Cart/hydrate-revalidation";
+    const nextCartId = "gid://shopify/Cart/replaced";
+    const lineQuantity = 1;
+    const removedQuantity = 0;
+    const lineA = makeLine({ id: "line-a", quantity: lineQuantity });
+    const lineB = makeLine({ id: "line-b", quantity: lineQuantity });
+    store.hydrate(
+      makeCartState({
+        id: initialCartId,
+        lines: [lineA, lineB],
+        totalQuantity: lineQuantity * 2,
+      }),
+    );
+
+    const removeA = mockUpdateCart({
+      lines: [{ id: lineA.id, quantity: removedQuantity }],
+    });
+    const removeB = mockUpdateCart({
+      lines: [{ id: lineB.id, quantity: removedQuantity }],
+    });
+    resolveUpdate(1, serverCart(lineQuantity, [{ id: lineA.id, quantity: lineQuantity }]));
+    resolveUpdate(0, serverCart(lineQuantity, [{ id: lineB.id, quantity: lineQuantity }]));
+    await Promise.all([removeA, removeB]);
+    await vi.waitFor(() => expect(store.getState().revalidating).toBe(true));
+    const revalidationOptions = mockGetCart.mock.calls[0][1] as {
+      signal?: AbortSignal;
+    };
+    assert(revalidationOptions.signal, "expected revalidation signal");
+
+    const nextCart = makeCartState({
+      id: nextCartId,
+      lines: [],
+      totalQuantity: removedQuantity,
+    });
+    store.hydrate(nextCart);
+    expect(revalidationOptions.signal.aborted).toBe(true);
+    expect(store.getState().revalidating).toBeUndefined();
+
+    revalidation.resolve({
+      cart: makeCartState({
+        id: initialCartId,
+        lines: [lineA],
+        totalQuantity: lineQuantity,
+      }),
+    });
+    await nextTick();
+
+    expect(store.getState().data).toEqual(nextCart);
+  });
+
+  it("surfaces authoritative revalidation failures without reverting local reconciliation", async () => {
+    const cartId = "gid://shopify/Cart/failed-revalidation";
+    const lineQuantity = 1;
+    const removedQuantity = 0;
+    const lineA = makeLine({ id: "line-a", quantity: lineQuantity });
+    const lineB = makeLine({ id: "line-b", quantity: lineQuantity });
+    const revalidationError = new Error("Authoritative cart revalidation failed");
+    mockGetCart.mockRejectedValueOnce(revalidationError);
+    store.hydrate(
+      makeCartState({
+        id: cartId,
+        lines: [lineA, lineB],
+        totalQuantity: lineQuantity * 2,
+      }),
+    );
+
+    const removeA = mockUpdateCart({
+      lines: [{ id: lineA.id, quantity: removedQuantity }],
+    });
+    const removeB = mockUpdateCart({
+      lines: [{ id: lineB.id, quantity: removedQuantity }],
+    });
+    resolveUpdate(1, serverCart(lineQuantity, [{ id: lineA.id, quantity: lineQuantity }]));
+    resolveUpdate(0, serverCart(lineQuantity, [{ id: lineB.id, quantity: lineQuantity }]));
+    await Promise.all([removeA, removeB]);
+    await vi.waitFor(() => expect(store.getState().errors.network).toHaveLength(1));
+
+    expect(getCartLines(store.getState().data)).toEqual([]);
+    expect(store.getState().data.totalQuantity).toBe(removedQuantity);
+    expect(store.getState().errors.network[0].message).toBe(
+      "Something went wrong refreshing your cart. Please try again.",
+    );
+
+    const noteUpdateIndex = 2;
+    const discountUpdateIndex = 3;
+    mockGetCart.mockResolvedValueOnce({
+      cart: makeCartState({
+        id: cartId,
+        lines: [],
+        totalQuantity: removedQuantity,
+      }),
+    });
+    const notePromise = mockUpdateCart({ note: "Gift wrapping please" });
+    const discountPromise = mockUpdateCart({ discountCodes: ["SAVE"] });
+    resolveUpdate(
+      discountUpdateIndex,
+      serverResult({ id: cartId, totalQuantity: removedQuantity, lines: [] }),
+    );
+    resolveUpdate(
+      noteUpdateIndex,
+      serverResult({ id: cartId, totalQuantity: removedQuantity, lines: [] }),
+    );
+    await Promise.all([notePromise, discountPromise]);
+    await vi.waitFor(() => expect(mockGetCart).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(store.getState().pending.note).toBe(false));
+
+    expect(store.getState().errors.network).toEqual([]);
+  });
+
   it("chained cancellation: aborted request does NOT modify state", async () => {
     const e1 = submitForm({ lineId: "line-1" }, "intent", "increase");
     const p1 = store.handleFormSubmit(e1);
@@ -1671,14 +2281,24 @@ describe("CartStore.handleFormSubmit — error handling", () => {
         ],
         discountCodes: [],
       },
-      userErrors: [{ code: "INVALID", message: "Something went wrong", field: ["lines", "0"] }],
+      userErrors: [
+        {
+          code: "INVALID",
+          message: "Something went wrong",
+          field: ["lines", "0"],
+        },
+      ],
     });
     await promise;
 
     const errors = store.getState().errors;
     const lineGroup = errors.lines.get("line-1");
     expect(lineGroup?.userErrors).toEqual([
-      { code: "INVALID", message: "Something went wrong", field: ["lines", "0"] },
+      {
+        code: "INVALID",
+        message: "Something went wrong",
+        field: ["lines", "0"],
+      },
     ]);
     expect(errors.discountCodes.size).toBe(0);
     expect(errors.note).toEqual(createEmptyCartErrors().note);
@@ -1700,7 +2320,10 @@ describe("CartStore.handleFormSubmit — error handling", () => {
   it("surfaces rejected line userErrors and warnings from Error.cause", async () => {
     const lineId = "gid://shopify/CartLine/line-1";
     store.hydrate(
-      makeCartState({ lines: [makeLine({ id: lineId, quantity: 2 })], totalQuantity: 2 }),
+      makeCartState({
+        lines: [makeLine({ id: lineId, quantity: 2 })],
+        totalQuantity: 2,
+      }),
     );
 
     const event = submitForm({ lineId }, "intent", "increase");
@@ -1737,7 +2360,10 @@ describe("CartStore.handleFormSubmit — error handling", () => {
 
   it("routes line network errors to errors.network instead of errors.lines", async () => {
     store.hydrate(
-      makeCartState({ lines: [makeLine({ id: "line-1", quantity: 2 })], totalQuantity: 2 }),
+      makeCartState({
+        lines: [makeLine({ id: "line-1", quantity: 2 })],
+        totalQuantity: 2,
+      }),
     );
     const event = submitForm({ lineId: "line-1" }, "intent", "increase");
     const promise = store.handleFormSubmit(event);
@@ -1786,7 +2412,13 @@ describe("CartStore.handleFormSubmit — error handling", () => {
     rejectUpdate(
       0,
       cartActionError({
-        userErrors: [{ code: "INVALID", message: "Bad code", field: ["discountCodes", "0"] }],
+        userErrors: [
+          {
+            code: "INVALID",
+            message: "Bad code",
+            field: ["discountCodes", "0"],
+          },
+        ],
       }),
     );
     await expect(promise).rejects.toThrow("Cart action failed");
@@ -1897,7 +2529,11 @@ describe("CartStore.handleFormSubmit — error handling", () => {
     resolveUpdate(0, {
       ...serverResult(),
       userErrors: [
-        { code: "INVALID", message: "Invalid gift message", field: ["attributes", "0"] },
+        {
+          code: "INVALID",
+          message: "Invalid gift message",
+          field: ["attributes", "0"],
+        },
       ],
     });
     await promise;
@@ -1906,7 +2542,11 @@ describe("CartStore.handleFormSubmit — error handling", () => {
     expect(state.data.attributes).toEqual([{ key: "gift-message", value: "Old" }]);
     expect(state.pending.attributes).toBe(false);
     expect(state.errors.attributes.get("gift-message")?.userErrors).toEqual([
-      { code: "INVALID", message: "Invalid gift message", field: ["attributes", "0"] },
+      {
+        code: "INVALID",
+        message: "Invalid gift message",
+        field: ["attributes", "0"],
+      },
     ]);
   });
 
@@ -2058,10 +2698,16 @@ describe("CartStore.handleFormSubmit — error handling", () => {
     const targetGroup = errors.lines.get(targetId);
 
     expect(lineGroup?.userErrors).toHaveLength(1);
-    expect(lineGroup?.userErrors[0]).toMatchObject({ code: "INVALID", message: "Bad" });
+    expect(lineGroup?.userErrors[0]).toMatchObject({
+      code: "INVALID",
+      message: "Bad",
+    });
 
     expect(targetGroup?.warnings).toHaveLength(1);
-    expect(targetGroup?.warnings[0]).toMatchObject({ code: "STOCK", message: "Limited" });
+    expect(targetGroup?.warnings[0]).toMatchObject({
+      code: "STOCK",
+      message: "Limited",
+    });
   });
 
   it("throws descriptive error when Standard Actions not available", async () => {
@@ -2689,6 +3335,7 @@ describe("CartStore.fetch", () => {
   });
 
   it("fetches from configured endpoint instead of getCart", async () => {
+    const keyBearingCartId = "gid://shopify/Cart/existing?key=secret";
     const mockFetch = vi.fn().mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -2704,15 +3351,18 @@ describe("CartStore.fetch", () => {
       ),
     );
     vi.stubGlobal("fetch", mockFetch);
-    store.hydrate(makeCartState({ id: "gid://shopify/Cart/existing" }));
+    store.hydrate(makeCartState({ id: keyBearingCartId }));
 
     configureCartEndpoint("/api/cart");
     await store.fetch();
 
     expect(mockGetCart).not.toHaveBeenCalled();
     expect(mockFetch).toHaveBeenCalledWith(
-      "/api/cart?cartId=gid%3A%2F%2Fshopify%2FCart%2Fexisting",
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      "/api/cart",
+      expect.objectContaining({
+        cache: "no-store",
+        signal: expect.any(AbortSignal),
+      }),
     );
 
     const state = store.getState();
@@ -2801,7 +3451,9 @@ describe("event-driven sync", () => {
       }),
     );
 
-    const externalPromise = mockUpdateCart({ lines: [{ id: "line-1", quantity: 5 }] });
+    const externalPromise = mockUpdateCart({
+      lines: [{ id: "line-1", quantity: 5 }],
+    });
 
     expect(getCartLines(store.getState().data)[0].quantity).toBe(5);
     expect(store.getState().pending.lines).toContain("line-1");
@@ -2827,6 +3479,53 @@ describe("event-driven sync", () => {
     expect(store.getState().pending.lines).not.toContain("line-1");
   });
 
+  it("does not consume a matching external event as a delayed internal event", async () => {
+    const initialQuantity = 1;
+    const updatedQuantity = 2;
+    const line = makeLine({ id: "line-1", quantity: initialQuantity });
+    mockUpdateCart = createStandardActionsMock({ dispatchEvents: false });
+    Object.defineProperty(window, "Shopify", {
+      value: { actions: { updateCart: mockUpdateCart, getCart: mockGetCart } },
+      configurable: true,
+      writable: true,
+    });
+    resetStandardActionsForTests();
+    mockGetCart.mockResolvedValue({
+      cart: makeCartState({ lines: [{ ...line, quantity: updatedQuantity }] }),
+    });
+    store.hydrate(makeCartState({ lines: [line], totalQuantity: initialQuantity }));
+
+    const internalMutation = store.handleFormSubmit(
+      submitForm({ lineId: line.id }, "intent", "increase"),
+    );
+    await vi.waitFor(() => expect(mockUpdateCart).toHaveBeenCalledTimes(1));
+
+    const externalMutation = createDeferred();
+    const externalEvent = Object.assign(
+      new Event("shopify:cart:lines-update", {
+        bubbles: true,
+        cancelable: true,
+      }),
+      {
+        action: "update" as const,
+        context: "standard-action" as const,
+        lines: [{ id: line.id, quantity: updatedQuantity }],
+        promise: externalMutation.promise,
+      },
+    );
+    document.dispatchEvent(externalEvent);
+    const externalError = new Error("External cart update failed");
+    externalMutation.reject(externalError);
+    resolveUpdate(0, serverCart(updatedQuantity, [{ id: line.id, quantity: updatedQuantity }]));
+
+    await internalMutation;
+    await vi.waitFor(() =>
+      expect(store.getState().errors.network).toContainEqual({
+        message: externalError.message,
+      }),
+    );
+  });
+
   it("external event during pending kit line mutation preserves optimistic", async () => {
     const lineA = makeLine({ id: "line-a", quantity: 3 });
     const lineB = makeLine({ id: "line-b", quantity: 2 });
@@ -2837,7 +3536,9 @@ describe("event-driven sync", () => {
     await nextTick();
     expect(getCartLines(store.getState().data).find((l) => l.id === "line-a")?.quantity).toBe(4);
 
-    const externalPromise = mockUpdateCart({ lines: [{ id: "line-b", quantity: 7 }] });
+    const externalPromise = mockUpdateCart({
+      lines: [{ id: "line-b", quantity: 7 }],
+    });
     expect(getCartLines(store.getState().data).find((l) => l.id === "line-b")?.quantity).toBe(7);
 
     resolveUpdate(
@@ -2876,7 +3577,9 @@ describe("event-driven sync", () => {
     await nextTick();
     expect(getCartLines(store.getState().data).some((l) => l.id === "line-a")).toBe(false);
 
-    const externalPromise = mockUpdateCart({ lines: [{ id: "line-b", quantity: 5 }] });
+    const externalPromise = mockUpdateCart({
+      lines: [{ id: "line-b", quantity: 5 }],
+    });
 
     resolveUpdate(
       1,
@@ -2915,7 +3618,9 @@ describe("event-driven sync", () => {
     await nextTick();
     expect(store.getState().data.discountCodes).toEqual([{ code: "SAVE10", applicable: false }]);
 
-    const externalPromise = mockUpdateCart({ lines: [{ id: "line-1", quantity: 5 }] });
+    const externalPromise = mockUpdateCart({
+      lines: [{ id: "line-1", quantity: 5 }],
+    });
 
     resolveUpdate(
       1,
@@ -2945,7 +3650,9 @@ describe("event-driven sync", () => {
       }),
     );
 
-    const externalPromise = mockUpdateCart({ lines: [{ id: "line-1", quantity: 10 }] });
+    const externalPromise = mockUpdateCart({
+      lines: [{ id: "line-1", quantity: 10 }],
+    });
     expect(getCartLines(store.getState().data)[0].quantity).toBe(10);
 
     rejectUpdate(0, new Error("Server error"));
@@ -3105,6 +3812,40 @@ describe("add-to-cart optimistic updates", () => {
     expect(store.getState().pending.lines).toEqual(new Set());
   });
 
+  it("accepts an authoritative total when an added line is outside the loaded connection", async () => {
+    const loadedQuantity = 250;
+    const unloadedQuantity = 1;
+    const addedQuantity = 1;
+    const initialTotalQuantity = loadedQuantity + unloadedQuantity;
+    const updatedTotalQuantity = initialTotalQuantity + addedQuantity;
+    const loadedLine = makeLine({
+      id: "line-loaded",
+      quantity: loadedQuantity,
+    });
+    store.hydrate(
+      makeCartState({
+        lines: [loadedLine],
+        totalQuantity: initialTotalQuantity,
+      }),
+    );
+
+    const externalPromise = mockUpdateCart({
+      lines: [{ merchandiseId: VARIANT_456, quantity: addedQuantity }],
+    });
+    resolveUpdate(
+      0,
+      serverResult({
+        totalQuantity: updatedTotalQuantity,
+        lines: [loadedLine],
+      }),
+    );
+    await externalPromise;
+
+    expect(getCartLines(store.getState().data)).toEqual([loadedLine]);
+    expect(store.getState().data.totalQuantity).toBe(updatedTotalQuantity);
+    expect(mockGetCart).not.toHaveBeenCalled();
+  });
+
   it("unknown merchandiseId with detail.products: creates optimistic line with merchandise", async () => {
     store.hydrate(
       makeCartState({
@@ -3117,7 +3858,11 @@ describe("add-to-cart optimistic updates", () => {
 
     const externalPromise = mockUpdateCart(
       { lines: [{ merchandiseId: VARIANT_456, quantity: 1 }] },
-      withProducts(productDetail(VARIANT_456, { price: { amount: "10", currencyCode: "USD" } })),
+      withProducts(
+        productDetail(VARIANT_456, {
+          price: { amount: "10", currencyCode: "USD" },
+        }),
+      ),
     );
 
     expect(getCartLines(store.getState().data)).toHaveLength(2);
@@ -3303,7 +4048,11 @@ describe("add-to-cart optimistic updates", () => {
 
     const externalPromise = mockUpdateCart(
       { lines: [{ merchandiseId: VARIANT_123, quantity: 1 }] },
-      withProducts(productDetail(VARIANT_123, { price: { amount: "25", currencyCode: "USD" } })),
+      withProducts(
+        productDetail(VARIANT_123, {
+          price: { amount: "25", currencyCode: "USD" },
+        }),
+      ),
     );
 
     expect(getCartLines(store.getState().data)).toHaveLength(1);
@@ -3427,8 +4176,14 @@ describe("add-to-cart optimistic updates", () => {
     resolveUpdate(
       1,
       serverResult({
-        totalQuantity: 0,
-        lines: [],
+        totalQuantity: 1,
+        lines: [
+          {
+            id: "line-real",
+            quantity: 1,
+            cost: { totalAmount: { amount: "25", currencyCode: "USD" } },
+          },
+        ],
       }),
     );
     await notePromise;
@@ -3453,6 +4208,7 @@ describe("add-to-cart optimistic updates", () => {
 
     expect(getCartLines(store.getState().data)).toHaveLength(1);
     expect(getCartLines(store.getState().data)[0].id).toBe("line-real");
+    expect(store.getState().data.totalQuantity).toBe(1);
     expect(store.getState().pending.lines).toEqual(new Set());
   });
 
@@ -3632,11 +4388,18 @@ describe("add-to-cart optimistic updates", () => {
 
     mockUpdateCart(
       { lines: [{ merchandiseId: VARIANT_123, quantity: 1 }] },
-      withProducts(productDetail(VARIANT_123, { price: { amount: "49.99", currencyCode: "CAD" } })),
+      withProducts(
+        productDetail(VARIANT_123, {
+          price: { amount: "49.99", currencyCode: "CAD" },
+        }),
+      ),
     );
 
     const line = getCartLines(store.getState().data)[0];
-    expect(line.cost.totalAmount).toEqual({ amount: "49.99", currencyCode: "CAD" });
+    expect(line.cost.totalAmount).toEqual({
+      amount: "49.99",
+      currencyCode: "CAD",
+    });
   });
 
   it("detail.products without price: optimistic line has zero cost", async () => {
@@ -3710,20 +4473,108 @@ describe("add-to-cart concurrency", () => {
   const VARIANT_123 = "gid://shopify/ProductVariant/123";
   const VARIANT_456 = "gid://shopify/ProductVariant/456";
 
+  it("concurrent first-cart adds preserve submission order and created identity", async () => {
+    store.reset();
+    const cartId = "gid://shopify/Cart/created-concurrently";
+    const lineQuantity = 1;
+    const concurrentAddCount = 3;
+    const authoritativeCart = makeCartState({
+      id: cartId,
+      lines: [lineWithMerchandise("line-a", lineQuantity * concurrentAddCount, VARIANT_123)],
+      totalQuantity: lineQuantity * concurrentAddCount,
+    });
+    mockGetCart.mockResolvedValue({ cart: authoritativeCart });
+
+    const addA = store.handleFormSubmit(
+      submitForm({ merchandiseId: VARIANT_123, quantity: String(lineQuantity) }, "intent", "add"),
+      { products: [productDetail(VARIANT_123)] },
+    );
+    const addB = store.handleFormSubmit(
+      submitForm({ merchandiseId: VARIANT_123, quantity: String(lineQuantity) }, "intent", "add"),
+      { products: [productDetail(VARIANT_123)] },
+    );
+    const addC = store.handleFormSubmit(
+      submitForm({ merchandiseId: VARIANT_123, quantity: String(lineQuantity) }, "intent", "add"),
+      { products: [productDetail(VARIANT_123)] },
+    );
+    await nextTick();
+    expect(mockUpdateCart).toHaveBeenCalledTimes(1);
+    expect(getCartLines(store.getState().data)).toHaveLength(1);
+    expect(getCartLines(store.getState().data)[0].quantity).toBe(lineQuantity * concurrentAddCount);
+
+    resolveUpdate(
+      0,
+      serverResult({
+        id: cartId,
+        totalQuantity: lineQuantity,
+        lines: [{ id: "line-a", quantity: lineQuantity }],
+      }),
+    );
+    await vi.waitFor(() => expect(mockUpdateCart).toHaveBeenCalledTimes(concurrentAddCount));
+    expect(mockUpdateCart.mock.calls[1][0]).toEqual({
+      cartId,
+      lines: [{ merchandiseId: VARIANT_123, quantity: lineQuantity }],
+    });
+    expect(mockUpdateCart.mock.calls[2][0]).toEqual({
+      cartId,
+      lines: [{ merchandiseId: VARIANT_123, quantity: lineQuantity }],
+    });
+    resolveUpdate(
+      2,
+      serverResult({
+        id: cartId,
+        totalQuantity: lineQuantity * concurrentAddCount,
+        lines: [{ id: "line-a", quantity: lineQuantity * concurrentAddCount }],
+      }),
+    );
+    await nextTick();
+    expect(mockGetCart).not.toHaveBeenCalled();
+    resolveUpdate(
+      1,
+      serverResult({
+        id: cartId,
+        totalQuantity: lineQuantity * 2,
+        lines: [{ id: "line-a", quantity: lineQuantity * 2 }],
+      }),
+    );
+    await Promise.all([addA, addB, addC]);
+    await vi.waitFor(() => expect(mockGetCart).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(store.getState().data.id).toBe(cartId));
+    await vi.waitFor(() =>
+      expect(getCartLines(store.getState().data)[0].quantity).toBe(
+        lineQuantity * concurrentAddCount,
+      ),
+    );
+
+    expect(store.getState().data.totalQuantity).toBe(authoritativeCart.totalQuantity);
+  });
+
   it("rapid same-variant adds: stale success responses are ignored", async () => {
     store.hydrate(makeCartState({ lines: [], totalQuantity: 0 }));
 
     mockUpdateCart(
       { lines: [{ merchandiseId: VARIANT_123, quantity: 1 }] },
-      withProducts(productDetail(VARIANT_123, { price: { amount: "10", currencyCode: "USD" } })),
+      withProducts(
+        productDetail(VARIANT_123, {
+          price: { amount: "10", currencyCode: "USD" },
+        }),
+      ),
     );
     mockUpdateCart(
       { lines: [{ merchandiseId: VARIANT_123, quantity: 1 }] },
-      withProducts(productDetail(VARIANT_123, { price: { amount: "10", currencyCode: "USD" } })),
+      withProducts(
+        productDetail(VARIANT_123, {
+          price: { amount: "10", currencyCode: "USD" },
+        }),
+      ),
     );
     const p3 = mockUpdateCart(
       { lines: [{ merchandiseId: VARIANT_123, quantity: 1 }] },
-      withProducts(productDetail(VARIANT_123, { price: { amount: "10", currencyCode: "USD" } })),
+      withProducts(
+        productDetail(VARIANT_123, {
+          price: { amount: "10", currencyCode: "USD" },
+        }),
+      ),
     );
 
     expect(getCartLines(store.getState().data)).toHaveLength(1);
@@ -3751,15 +4602,27 @@ describe("add-to-cart concurrency", () => {
 
     mockUpdateCart(
       { lines: [{ merchandiseId: VARIANT_123, quantity: 1 }] },
-      withProducts(productDetail(VARIANT_123, { price: { amount: "10", currencyCode: "USD" } })),
+      withProducts(
+        productDetail(VARIANT_123, {
+          price: { amount: "10", currencyCode: "USD" },
+        }),
+      ),
     );
     mockUpdateCart(
       { lines: [{ merchandiseId: VARIANT_123, quantity: 1 }] },
-      withProducts(productDetail(VARIANT_123, { price: { amount: "10", currencyCode: "USD" } })),
+      withProducts(
+        productDetail(VARIANT_123, {
+          price: { amount: "10", currencyCode: "USD" },
+        }),
+      ),
     );
     const p3 = mockUpdateCart(
       { lines: [{ merchandiseId: VARIANT_123, quantity: 1 }] },
-      withProducts(productDetail(VARIANT_123, { price: { amount: "10", currencyCode: "USD" } })),
+      withProducts(
+        productDetail(VARIANT_123, {
+          price: { amount: "10", currencyCode: "USD" },
+        }),
+      ),
     );
 
     expect(getCartLines(store.getState().data)[0].quantity).toBe(3);
@@ -3773,14 +4636,18 @@ describe("add-to-cart concurrency", () => {
     expect(store.getState().pending.lines).toEqual(new Set());
   });
 
-  it("superseded add rejection skips optimistic rollback", async () => {
+  it("rejected relative add rolls back only its own optimistic payload", async () => {
     store.hydrate(makeCartState({ lines: [], totalQuantity: 0 }));
 
     const optimisticId = `optimistic:${VARIANT_123}`;
 
     const p1 = mockUpdateCart(
       { lines: [{ merchandiseId: VARIANT_123, quantity: 1 }] },
-      withProducts(productDetail(VARIANT_123, { price: { amount: "10", currencyCode: "USD" } })),
+      withProducts(
+        productDetail(VARIANT_123, {
+          price: { amount: "10", currencyCode: "USD" },
+        }),
+      ),
     );
 
     expect(getCartLines(store.getState().data)[0].id).toBe(optimisticId);
@@ -3788,7 +4655,11 @@ describe("add-to-cart concurrency", () => {
 
     const p2 = mockUpdateCart(
       { lines: [{ merchandiseId: VARIANT_123, quantity: 1 }] },
-      withProducts(productDetail(VARIANT_123, { price: { amount: "10", currencyCode: "USD" } })),
+      withProducts(
+        productDetail(VARIANT_123, {
+          price: { amount: "10", currencyCode: "USD" },
+        }),
+      ),
     );
 
     expect(getCartLines(store.getState().data)[0].quantity).toBe(2);
@@ -3797,7 +4668,7 @@ describe("add-to-cart concurrency", () => {
     await p1.catch(() => {});
 
     expect(getCartLines(store.getState().data)).toHaveLength(1);
-    expect(getCartLines(store.getState().data)[0].quantity).toBe(2);
+    expect(getCartLines(store.getState().data)[0].quantity).toBe(1);
 
     resolveUpdate(1, serverCart(2, [{ id: "line-real", quantity: 2 }]));
     await p2;
@@ -3812,7 +4683,11 @@ describe("add-to-cart concurrency", () => {
 
     const p1 = mockUpdateCart(
       { lines: [{ merchandiseId: VARIANT_123, quantity: 1 }] },
-      withProducts(productDetail(VARIANT_123, { price: { amount: "10", currencyCode: "USD" } })),
+      withProducts(
+        productDetail(VARIANT_123, {
+          price: { amount: "10", currencyCode: "USD" },
+        }),
+      ),
     );
 
     expect(getCartLines(store.getState().data)).toHaveLength(1);
@@ -3860,8 +4735,12 @@ describe("add-to-cart concurrency", () => {
         ],
       },
       withProducts(
-        productDetail(VARIANT_123, { price: { amount: "10", currencyCode: "USD" } }),
-        productDetail(VARIANT_456, { price: { amount: "20", currencyCode: "USD" } }),
+        productDetail(VARIANT_123, {
+          price: { amount: "10", currencyCode: "USD" },
+        }),
+        productDetail(VARIANT_456, {
+          price: { amount: "20", currencyCode: "USD" },
+        }),
       ),
     );
 
@@ -3869,7 +4748,11 @@ describe("add-to-cart concurrency", () => {
 
     const p2 = mockUpdateCart(
       { lines: [{ merchandiseId: VARIANT_123, quantity: 1 }] },
-      withProducts(productDetail(VARIANT_123, { price: { amount: "10", currencyCode: "USD" } })),
+      withProducts(
+        productDetail(VARIANT_123, {
+          price: { amount: "10", currencyCode: "USD" },
+        }),
+      ),
     );
 
     expect(
@@ -3904,7 +4787,11 @@ describe("add-to-cart concurrency", () => {
 
     mockUpdateCart(
       { lines: [{ merchandiseId: VARIANT_123, quantity: 1 }] },
-      withProducts(productDetail(VARIANT_123, { price: { amount: "10", currencyCode: "USD" } })),
+      withProducts(
+        productDetail(VARIANT_123, {
+          price: { amount: "10", currencyCode: "USD" },
+        }),
+      ),
     );
 
     expect(getCartLines(store.getState().data)).toHaveLength(1);
@@ -3924,7 +4811,7 @@ describe("add-to-cart concurrency", () => {
     });
   });
 
-  it("rapid add via configured cart endpoint: abort signal fires on supersession", async () => {
+  it("rapid relative adds do not abort earlier endpoint requests", async () => {
     const mockFetch = vi.fn();
     vi.stubGlobal("fetch", mockFetch);
     configureCartEndpoint("/api/cart");
@@ -3948,7 +4835,9 @@ describe("add-to-cart concurrency", () => {
 
     const addPayload = { lines: [{ merchandiseId: VARIANT_123, quantity: 1 }] };
     const addOptions = withProducts(
-      productDetail(VARIANT_123, { price: { amount: "10", currencyCode: "USD" } }),
+      productDetail(VARIANT_123, {
+        price: { amount: "10", currencyCode: "USD" },
+      }),
     );
 
     mockUpdateCart(addPayload, addOptions);
@@ -3958,7 +4847,7 @@ describe("add-to-cart concurrency", () => {
     handler(vi.fn(), addPayload, { signal: new AbortController().signal });
 
     const [, init1] = mockFetch.mock.calls[0];
-    expect(init1.signal.aborted).toBe(true);
+    expect(init1.signal.aborted).toBe(false);
 
     const [, init2] = mockFetch.mock.calls[1];
     expect(init2.signal.aborted).toBe(false);
@@ -4073,12 +4962,9 @@ describe("cart: null resolution", () => {
     });
   });
 
-  it("lines add: untracked bump does not subtract quantity already owned by a superseding add", async () => {
-    // Rapid adds for the same merchandiseId, both without detail.products:
-    //   1) request A bumps totalQuantity by 2
-    //   2) request B (newer) supersedes A and bumps totalQuantity by 1
-    //   3) A resolves cart: null → must NOT subtract A's 2 from the bumped total
-    //      because A no longer owns the merchandiseId.
+  it("lines add: failed unkeyed add removes only its quantity bump", async () => {
+    // Relative adds remain independent while pending. If A fails, its quantity
+    // is removed while B's still-pending quantity remains projected.
     store.hydrate(makeCartState({ lines: [], totalQuantity: 0 }));
 
     const promiseA = mockUpdateCart({
@@ -4103,7 +4989,7 @@ describe("cart: null resolution", () => {
     });
     await promiseA;
 
-    expect(store.getState().data.totalQuantity).toBe(3);
+    expect(store.getState().data.totalQuantity).toBe(1);
 
     resolveUpdate(
       1,
@@ -4123,7 +5009,7 @@ describe("cart: null resolution", () => {
     expect(store.getState().data.totalQuantity).toBe(1);
   });
 
-  it("lines add: mixed tracked and untracked rollback preserves superseded untracked quantity", async () => {
+  it("lines add: mixed rollback preserves the other relative transaction", async () => {
     store.hydrate(
       makeCartState({
         lines: [lineWithMerchandise("line-1", 2, VARIANT_123)],
@@ -4164,7 +5050,7 @@ describe("cart: null resolution", () => {
     await promiseA;
 
     expect(getCartLines(store.getState().data)[0].quantity).toBe(2);
-    expect(store.getState().data.totalQuantity).toBe(5);
+    expect(store.getState().data.totalQuantity).toBe(3);
     expect(store.getState().errors.lines.get("line-1")?.userErrors).toHaveLength(1);
     expect(store.getState().errors.cart.userErrors).toHaveLength(1);
 
@@ -4228,7 +5114,9 @@ describe("cart: null resolution", () => {
       }),
     );
 
-    const externalPromise = mockUpdateCart({ lines: [{ id: "line-1", quantity: 10 }] });
+    const externalPromise = mockUpdateCart({
+      lines: [{ id: "line-1", quantity: 10 }],
+    });
     expect(getCartLines(store.getState().data)[0].quantity).toBe(10);
     expect(store.getState().pending.lines).toContain("line-1");
 
@@ -4251,7 +5139,9 @@ describe("cart: null resolution", () => {
       }),
     );
 
-    const externalPromise = mockUpdateCart({ lines: [{ id: "line-1", quantity: 0 }] });
+    const externalPromise = mockUpdateCart({
+      lines: [{ id: "line-1", quantity: 0 }],
+    });
     expect(getCartLines(store.getState().data)).toHaveLength(0);
 
     resolveUpdate(0, {
@@ -4329,7 +5219,9 @@ describe("CartStore.handleFormSubmit — add intent", () => {
 
     expect(mockUpdateCart).toHaveBeenCalledTimes(1);
     expect(mockUpdateCart).toHaveBeenCalledWith(
-      { lines: [{ merchandiseId: "gid://shopify/ProductVariant/1", quantity: 2 }] },
+      {
+        lines: [{ merchandiseId: "gid://shopify/ProductVariant/1", quantity: 2 }],
+      },
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
 
@@ -4361,7 +5253,9 @@ describe("CartStore.handleFormSubmit — add intent", () => {
     await nextTick();
 
     expect(mockUpdateCart).toHaveBeenCalledWith(
-      { lines: [{ merchandiseId: "gid://shopify/ProductVariant/1", quantity: 1 }] },
+      {
+        lines: [{ merchandiseId: "gid://shopify/ProductVariant/1", quantity: 1 }],
+      },
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
 
@@ -4463,7 +5357,9 @@ describe("CartStore.handleFormSubmit — add intent", () => {
     await nextTick();
 
     expect(mockUpdateCart).toHaveBeenCalledWith(
-      { lines: [{ merchandiseId: "gid://shopify/ProductVariant/1", quantity: 1 }] },
+      {
+        lines: [{ merchandiseId: "gid://shopify/ProductVariant/1", quantity: 1 }],
+      },
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
 
@@ -4572,7 +5468,9 @@ describe("getShopifyStandardActions", () => {
 
     await vi.waitFor(() => expect(updateCart).toHaveBeenCalledTimes(1));
     expect(updateCart).toHaveBeenCalledWith(
-      { lines: [{ merchandiseId: "gid://shopify/ProductVariant/1", quantity: 1 }] },
+      {
+        lines: [{ merchandiseId: "gid://shopify/ProductVariant/1", quantity: 1 }],
+      },
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
 
@@ -4725,24 +5623,25 @@ describe("configureCartEndpoint", () => {
   });
 
   it("same endpoint is a no-op", () => {
-    const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const logger = createTestLogger();
+    configureLogging({ logger });
     configureCartEndpoint("/api/cart");
     configureCartEndpoint("/api/cart");
-    expect(consoleSpy).not.toHaveBeenCalled();
-    consoleSpy.mockRestore();
+    expect(logger.warn).not.toHaveBeenCalled();
   });
 
   it("different endpoint warns and replaces handler", async () => {
-    const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const logger = createTestLogger();
+    configureLogging({ logger });
     configureCartEndpoint("/api/cart");
     configureCartEndpoint("/custom/cart");
-    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("/custom/cart"));
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("/custom/cart"), {
+      scope: "cart",
+    });
 
     const handler = extractConfiguredHandler();
     mockFetch.mockResolvedValueOnce(new Response(JSON.stringify({ cart: null }), { status: 200 }));
     await handler(vi.fn(), { lines: [{ id: "x", quantity: 1 }] });
     expect(mockFetch).toHaveBeenCalledWith("/custom/cart", expect.anything());
-
-    consoleSpy.mockRestore();
   });
 });

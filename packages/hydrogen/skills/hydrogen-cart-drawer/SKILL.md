@@ -181,15 +181,15 @@ return (
 window.Shopify.actions.openCart();
 ```
 
-**3. After a successful add-to-cart** — if the product UX should open the drawer on add, pass the same helper to the product form's submit hooks.
+**3. From add-to-cart** — when the canonical cart trigger is an anchor, open the drawer immediately with optimistic state so pending cart contents remain inspectable. Opening only after success is compatible with the storefront contract only when the page also provides a visible button that opens the drawer while the mutation is pending.
 
 ```tsx
-<form {...formProps({ afterSubmit: openCartDrawer })}>
+<form {...formProps({ beforeSubmit: openCartDrawer })}>
   {/* add-to-cart controls */}
 </form>
 ```
 
-This opens the drawer only after the mutation succeeds. Keep validation and cancellation in `beforeSubmit` — for example, call `event.preventDefault()` there if the quantity is invalid and the drawer should not open. Do not push this policy into core cart mutations; some storefronts want a toast, a cart page navigation, or no automatic UI change.
+Validate before calling the drawer helper — for example, call `event.preventDefault()` and return if the quantity is invalid. Do not push this policy into core cart mutations; some storefronts want a toast, a cart page navigation, or no automatic UI change.
 
 ### Closing the drawer
 
