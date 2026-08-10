@@ -1,68 +1,23 @@
 <script setup lang="ts">
-import {
-  getShopPayButtonAttributes,
-  getShopPayButtonStyleProperties,
-  loadShopJs,
-  SHOP_PAY_BUTTON_TAG_NAME,
-  type ShopPayButtonOptions,
-} from "@shopify/hydrogen";
-import { computed, onMounted, ref } from "vue";
+import { renderShopPayButton, type ShopPayButtonOptions } from "@shopify/hydrogen";
+import { computed } from "vue";
 
-const props = withDefaults(
-  defineProps<{
-    variants?: ShopPayButtonOptions["variants"];
-    paymentOption?: ShopPayButtonOptions["paymentOption"];
-    source?: string;
-    sourceToken?: string;
-    channel?: ShopPayButtonOptions["channel"];
-    disabled?: boolean;
-    width?: string;
-    borderRadius?: string;
-    loadScript?: boolean;
-  }>(),
-  {
-    disabled: false,
-    loadScript: true,
-  },
-);
+const props = defineProps<{
+  variants?: ShopPayButtonOptions["variants"];
+  checkoutUrl?: string;
+  paymentOption?: ShopPayButtonOptions["paymentOption"];
+  source?: string;
+  sourceToken?: string;
+  channel?: ShopPayButtonOptions["channel"];
+  disabled?: boolean;
+  width?: string;
+  borderRadius?: string;
+}>();
 
-const DEFAULT_SHOP_PAY_BUTTON_MIN_HEIGHT = "43px";
-const storefrontUrl = ref<string>();
-
-onMounted(() => {
-  storefrontUrl.value = window.location.origin;
-  if (!props.loadScript) return;
-  loadShopJs().catch((error: unknown) => {
-    console.error("[hydrogen:error:ShopPay] shop-js failed to load:", error);
-  });
-});
-
-const attrs = computed(() =>
-  getShopPayButtonAttributes({
-    variants: props.variants,
-    paymentOption: props.paymentOption,
-    source: props.source,
-    sourceToken: props.sourceToken,
-    channel: props.channel,
-    disabled: props.disabled,
-    checkoutUrl: storefrontUrl.value,
-  }),
-);
-
-const style = computed(() =>
-  getShopPayButtonStyleProperties({
-    width: props.width,
-    borderRadius: props.borderRadius,
-  }),
-);
-
-const wrapperStyle = computed(() => ({
-  minHeight: DEFAULT_SHOP_PAY_BUTTON_MIN_HEIGHT,
-}));
+const html = computed(() => renderShopPayButton(props));
 </script>
 
 <template>
-  <div :style="wrapperStyle">
-    <component :is="SHOP_PAY_BUTTON_TAG_NAME" v-bind="attrs" :style="style" />
-  </div>
+  <!-- Trusted markup produced by @shopify/hydrogen; user inputs are escaped by renderShopPayButton. -->
+  <div style="display: contents" v-html="html" />
 </template>
