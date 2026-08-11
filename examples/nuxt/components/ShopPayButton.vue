@@ -12,6 +12,7 @@ const props = defineProps<{
   disabled?: boolean;
   width?: string;
   borderRadius?: string;
+  accessibilityLabel?: string;
 }>();
 
 const html = computed(() => renderShopPayButton(props));
