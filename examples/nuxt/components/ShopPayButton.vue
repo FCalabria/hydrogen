@@ -8,7 +8,6 @@ const props = defineProps<{
   paymentOption?: ShopPayButtonOptions["paymentOption"];
   source?: string;
   sourceToken?: string;
-  channel?: ShopPayButtonOptions["channel"];
   disabled?: boolean;
   width?: string;
   borderRadius?: string;
